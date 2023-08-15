@@ -25,7 +25,7 @@ class TestWhisperValidationSet(unittest.TestCase):
     for c in ci:
       fn = BASEDIR / c["files"][0]["fname"]
       print("-" * 128, f"{fn.stem}\n", sep="\n")
-      waveform, _ = librosa.load(fn, mono=True, sr=None)
+      waveform, _ = librosa.load(fn, sr=None)
       predicted = "".join(transcribe(TestWhisperValidationSet.model, waveform)).translate(str.maketrans("", "", string.punctuation)).lower()
       transcript = c["transcript"].translate(str.maketrans("", "", string.punctuation))
       sys.stdout.writelines(list(diff.compare([predicted + "\n"], [transcript + "\n"])))

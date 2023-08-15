@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional
-import base64
+import base64, string
 import multiprocessing
 import numpy as np
 from extra.utils import download_file
@@ -259,6 +259,7 @@ def _prep_audio(waveform=None, sr=_RATE, padding=0) -> Tensor:
   _N_FFT = 400
   _N_MELS = 80
   if padding > 0: waveform = np.pad(waveform, (0, padding))
+  if waveform is None: waveform = np.zeros(_N_FFT, dtype=np.float32)
   S = np.abs(librosa.stft(waveform, n_fft=_N_FFT, hop_length=_HOP_LENGTH, win_length=_N_FFT, window=librosa.filters.get_window("hann", _N_FFT), pad_mode="reflect"))**2
   mel_spec = librosa.feature.melspectrogram(S=S, sr=sr, n_fft=_N_FFT, n_mels=_N_MELS)
   log_spec = np.log10(np.clip(mel_spec, a_min=1e-10, a_max=None))
@@ -298,21 +299,26 @@ def listener(q):
   _prep_audio()
   p = pyaudio.PyAudio()
   stream = p.open(format=pyaudio.paInt16, channels=1, rate=_RATE, input=True, frames_per_buffer=_CHUNK)
-  print("listening")
-  for _ in range(0, int(_RATE / _CHUNK * _RECORD_SECONDS)):
-    data = stream.read(_CHUNK)
-    waveform = ((np.frombuffer(data, np.int16)/32768).astype(np.float32)*3).reshape(1, -1)
-    q.put(waveform)
-  print("done listening")
+  print("\n\rlistening...")
+  try:
+    for _ in range(0, int(_RATE / _CHUNK * _RECORD_SECONDS)):
+      data = stream.read(_CHUNK)
+      waveform = ((np.frombuffer(data, np.int16)/32768).astype(np.float32)*3).reshape(1, -1)
+      q.put(waveform)
+  except KeyboardInterrupt:
+    pass
+  finally:
+    q.put(None)
+    print("\ndone listening.")
 
 def load_model(name: str = None):
   if not name:
     sizes = ["TINY", "BASE", "SMALL", "MEDIUM", "LARGE"]
     envs = [x for x in sizes if getenv(x)]
     if len(envs) == 0:
-      name = "base.en"
+      name = "base"
     else:
-      name = f"{envs[0].lower()}.en"
+      name = f"{envs[0].lower()}"
   if name not in available_models():
     raise ValueError(f"unknown model {name}")
   fn = _BASE / f"whisper-{name}.pt"
@@ -327,14 +333,13 @@ def load_model(name: str = None):
 def transcribe(model, waveform, logprob_threshold=-1.0, no_speech_threshold=0.6):
   mel = _prep_audio(waveform, padding=N_SAMPLES)
   content_frames = mel.shape[-1] - N_FRAMES
-  print(content_frames)
   initial_tokens = [model.encoding._special_tokens["<|startoftranscript|>"], model.encoding._special_tokens["<|en|>"],
                     model.encoding._special_tokens["<|transcribe|>"]]
   seek, texts = 0, []
+  print(content_frames)
   while seek < content_frames:
     mel_segment = mel[:, seek:seek+N_FRAMES]
     mel_segment = _pad_or_trim(mel_segment, N_FRAMES)
-    print(mel_segment.shape[-1])
     segment_size = min(N_FRAMES, content_frames - seek)
     texts += model.decode_segment(mel_segment, initial_tokens)
     seek += segment_size
@@ -345,9 +350,9 @@ if __name__ == "__main__":
 
   if len(sys.argv) > 1:
     # offline
-    waveform, sample_rate = librosa.load(sys.argv[1], mono=True, sr=None)
+    waveform, sample_rate = librosa.load(sys.argv[1], sr=None)
     assert sample_rate == _RATE
-    print(transcribe(model, waveform)) # .translate(str.maketrans("", "", string.punctuation)).lower())
+    print(transcribe(model, waveform).translate(str.maketrans("", "", string.punctuation)).lower())
   else:
     # online
     q = multiprocessing.Queue()
@@ -355,24 +360,38 @@ if __name__ == "__main__":
     p.daemon = True
     p.start()
 
-    lst = [model.encoding._special_tokens["<|startoftranscript|>"]]
     total = None
+    initial_tokens = [model.encoding._special_tokens["<|startoftranscript|>"], model.encoding._special_tokens["<|en|>"],
+            model.encoding._special_tokens["<|transcribe|>"]]
     did_read = False
-    for i in range(0, int(_RATE / _CHUNK * _RECORD_SECONDS)):
-      while not q.empty() or total is None:
-        waveform = q.get()
-        if total is None: total = waveform
-        else: total = np.concatenate([total, waveform], axis=1)
-        did_read = True
-      if did_read:
-        last_total = total.shape[1]
-        log_spec = _prep_audio(waveform=Tensor(total).numpy())
-        encoded_audio = model.encoder(Tensor(log_spec)).realize()
-      out = model.decoder(Tensor([lst]), encoded_audio).realize()
-      idx = out[0,-1].numpy().argmax()
-      lst.append(idx)
-      dec = model.encoding.decode(lst)
-      print(dec) # DO NOT REMOVE PRINT. IT'S VERY IMPORTANT
-      if dec.endswith("<|endoftext|>"):
-        #total = total[:, 320*(len(lst)-1):]
-        lst = [model.encoding._special_tokens["<|startoftranscript|>"]]
+    seek, texts = 0, []
+    waveform = None
+    done = False
+    try:
+      while not done: 
+        while not q.empty() or total is None:
+          waveform = q.get()
+          if waveform is None: 
+            done = True 
+            break
+          if total is None: total = waveform
+          else: total = np.concatenate([total, waveform], axis=1)
+          did_read = True
+        if did_read:
+          last_total = total.shape[1]
+          mel = _prep_audio(waveform=Tensor(total).numpy())
+          content_frames = mel.shape[-1] - N_FRAMES
+          mel_segment = mel[:, seek:seek+N_FRAMES]
+          mel_segment = _pad_or_trim(mel_segment, N_FRAMES)
+          segment_size = min(N_FRAMES, content_frames - seek)
+          dec = model.decode_segment(mel_segment, initial_tokens)
+        text = "".join(dec)
+        print("\r"+text, end="\r")
+    except KeyboardInterrupt:
+      pass
+    finally:
+      p.terminate()
+      p.join()
+      print("")
+
+      
